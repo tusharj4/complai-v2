@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "FastAPI Dev Server",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app.main:app", "--reload", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "Celery Worker",
+      "runtimeExecutable": "celery",
+      "runtimeArgs": ["-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4"],
+      "port": null
+    },
+    {
+      "name": "Celery Beat Scheduler",
+      "runtimeExecutable": "celery",
+      "runtimeArgs": ["-A", "app.celery_app", "beat", "--loglevel=info"],
+      "port": null
+    },
+    {
+      "name": "Docker Compose (All Services)",
+      "runtimeExecutable": "docker-compose",
+      "runtimeArgs": ["up"],
+      "port": 8000
+    }
+  ]
+}
