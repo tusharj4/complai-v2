@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     DATADOG_API_KEY: str = ""
     DATADOG_APP_KEY: str = ""
 
+    # Kafka
+    KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9092"
+
+    # Slack (for critical alerts)
+    SLACK_WEBHOOK_URL: str = ""
+
     # App
     APP_ENV: str = "development"
     DEBUG: bool = True

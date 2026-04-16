@@ -1,7 +1,7 @@
 import re
 from pydantic import BaseModel, Field, field_validator
 from uuid import UUID
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from datetime import datetime
 
 
@@ -62,3 +62,26 @@ class TokenRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+# --- Manual Override ---
+
+class ManualOverrideRequest(BaseModel):
+    new_status: str = Field(..., pattern=r"^(compliant|non_compliant|review_required)$")
+    reason: str = Field(..., min_length=5, max_length=1000)
+
+
+# --- Webhook Schemas ---
+
+class WebhookCreate(BaseModel):
+    url: str = Field(..., min_length=10)
+    event_types: List[str] = Field(..., min_length=1)
+    company_id: Optional[UUID] = None
+
+
+class WebhookResponse(BaseModel):
+    id: UUID
+    url: str
+    event_types: List[str]
+    company_id: Optional[UUID] = None
+    is_active: bool = True

@@ -183,3 +183,120 @@ def test_create_document(client, auth_headers):
     assert doc_resp.status_code == 200
     assert doc_resp.json()["document_type"] == "gst_return"
     assert doc_resp.json()["extraction_status"] == "pending"
+
+
+# --- Manual Override (Phase 2) ---
+
+def test_manual_override(client, auth_headers):
+    create_resp = client.post(
+        "/api/v1/companies",
+        json={"name": "Override Co", "gst_id": "27AABAA0000A1Z5"},
+        headers=auth_headers,
+    )
+    company_id = create_resp.json()["id"]
+
+    doc_resp = client.post(
+        "/api/v1/documents",
+        json={"company_id": company_id, "document_type": "gst_return"},
+        headers=auth_headers,
+    )
+    doc_id = doc_resp.json()["id"]
+
+    override_resp = client.post(
+        f"/api/v1/documents/{doc_id}/override",
+        json={"new_status": "compliant", "reason": "Manually verified by auditor"},
+        headers=auth_headers,
+    )
+    assert override_resp.status_code == 200
+    assert override_resp.json()["ok"] is True
+
+    # Verify compliance status updated
+    status_resp = client.get(f"/api/v1/companies/{company_id}/compliance-status", headers=auth_headers)
+    assert status_resp.json()["documents"][0]["status"] == "compliant"
+    assert status_resp.json()["overall_status"] == "compliant"
+
+
+def test_manual_override_invalid_status(client, auth_headers):
+    create_resp = client.post(
+        "/api/v1/companies",
+        json={"name": "Bad Override Co", "gst_id": "27AABAA0000A1Z5"},
+        headers=auth_headers,
+    )
+    company_id = create_resp.json()["id"]
+
+    doc_resp = client.post(
+        "/api/v1/documents",
+        json={"company_id": company_id, "document_type": "gst_return"},
+        headers=auth_headers,
+    )
+    doc_id = doc_resp.json()["id"]
+
+    override_resp = client.post(
+        f"/api/v1/documents/{doc_id}/override",
+        json={"new_status": "invalid_status", "reason": "Testing"},
+        headers=auth_headers,
+    )
+    assert override_resp.status_code == 422
+
+
+# --- Retry Endpoint (Phase 2) ---
+
+def test_retry_document(client, auth_headers, monkeypatch):
+    # Mock Celery task to avoid Redis dependency
+    from unittest.mock import MagicMock
+    mock_result = MagicMock()
+    mock_result.id = "mock-job-id"
+    monkeypatch.setattr("app.tasks.workers.extract_and_classify.apply_async", lambda **kwargs: mock_result)
+
+    create_resp = client.post(
+        "/api/v1/companies",
+        json={"name": "Retry Co", "gst_id": "27AABAA0000A1Z5"},
+        headers=auth_headers,
+    )
+    company_id = create_resp.json()["id"]
+
+    doc_resp = client.post(
+        "/api/v1/documents",
+        json={"company_id": company_id, "document_type": "gst_return"},
+        headers=auth_headers,
+    )
+    doc_id = doc_resp.json()["id"]
+
+    retry_resp = client.post(f"/api/v1/documents/{doc_id}/retry", headers=auth_headers)
+    assert retry_resp.status_code == 200
+    assert retry_resp.json()["ok"] is True
+
+    # Verify status reset to pending
+    doc_check = client.get(f"/api/v1/documents/{doc_id}", headers=auth_headers)
+    assert doc_check.json()["extraction_status"] == "pending"
+
+
+# --- Audit Log with Override Events ---
+
+def test_audit_log_records_override(client, auth_headers):
+    create_resp = client.post(
+        "/api/v1/companies",
+        json={"name": "Audit Override Co", "gst_id": "27AABAA0000A1Z5"},
+        headers=auth_headers,
+    )
+    company_id = create_resp.json()["id"]
+
+    doc_resp = client.post(
+        "/api/v1/documents",
+        json={"company_id": company_id, "document_type": "gst_return"},
+        headers=auth_headers,
+    )
+    doc_id = doc_resp.json()["id"]
+
+    # Override
+    client.post(
+        f"/api/v1/documents/{doc_id}/override",
+        json={"new_status": "non_compliant", "reason": "Found issues during review"},
+        headers=auth_headers,
+    )
+
+    # Check audit log
+    log_resp = client.get(f"/api/v1/companies/{company_id}/audit-log", headers=auth_headers)
+    assert log_resp.status_code == 200
+    logs = log_resp.json()
+    assert any(log["event_type"] == "manual_override" for log in logs)

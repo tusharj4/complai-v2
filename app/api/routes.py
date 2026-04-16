@@ -6,7 +6,10 @@ from sqlalchemy.orm import Session
 from app.auth import verify_token
 from app.database import get_db
 from app.models import Company, Document, Classification, AuditLog
-from app.api.schemas import CompanyCreate, CompanyResponse, DocumentCreate, DocumentResponse
+from app.api.schemas import (
+    CompanyCreate, CompanyResponse, DocumentCreate, DocumentResponse,
+    ManualOverrideRequest,
+)
 
 router = APIRouter(prefix="/api/v1")
 
@@ -25,7 +28,20 @@ def _get_company_authorized(company_id: PyUUID, current_user: dict, db: Session)
     return company
 
 
-# --- Company Routes ---
+def _get_document_authorized(document_id: PyUUID, current_user: dict, db: Session) -> Document:
+    """Helper to get a document and verify partner ownership."""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    company = db.query(Company).filter(Company.id == doc.company_id).first()
+    if company.partner_id != _partner_uuid(current_user):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return doc
+
+
+# ============================================================
+# Company Routes
+# ============================================================
 
 @router.post("/companies", response_model=CompanyResponse)
 async def create_company(
@@ -54,13 +70,12 @@ async def list_companies(
     current_user=Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    companies = (
+    return (
         db.query(Company)
         .filter(Company.partner_id == _partner_uuid(current_user))
         .order_by(Company.created_at.desc())
         .all()
     )
-    return companies
 
 
 @router.get("/companies/{company_id}", response_model=CompanyResponse)
@@ -72,7 +87,9 @@ async def get_company(
     return _get_company_authorized(company_id, current_user, db)
 
 
-# --- Scrape Trigger ---
+# ============================================================
+# Scrape Trigger
+# ============================================================
 
 @router.post("/companies/{company_id}/scrape")
 async def trigger_scrape(
@@ -81,14 +98,14 @@ async def trigger_scrape(
     db: Session = Depends(get_db),
 ):
     _get_company_authorized(company_id, current_user, db)
-
     from app.tasks.orchestration import scrape_and_classify_company
     job = scrape_and_classify_company.apply_async(args=[str(company_id)])
-
     return {"job_id": job.id, "status": "queued"}
 
 
-# --- Compliance Status ---
+# ============================================================
+# Compliance Status
+# ============================================================
 
 @router.get("/companies/{company_id}/compliance-status")
 async def get_compliance_status(
@@ -97,7 +114,6 @@ async def get_compliance_status(
     db: Session = Depends(get_db),
 ):
     _get_company_authorized(company_id, current_user, db)
-
     documents = db.query(Document).filter(Document.company_id == company_id).all()
 
     docs_status = []
@@ -108,7 +124,6 @@ async def get_compliance_status(
             .order_by(Classification.created_at.desc())
             .first()
         )
-
         docs_status.append({
             "document_id": str(doc.id),
             "document_type": doc.document_type,
@@ -132,7 +147,9 @@ async def get_compliance_status(
     }
 
 
-# --- Audit Log ---
+# ============================================================
+# Audit Log
+# ============================================================
 
 @router.get("/companies/{company_id}/audit-log")
 async def get_audit_log(
@@ -143,7 +160,6 @@ async def get_audit_log(
     db: Session = Depends(get_db),
 ):
     _get_company_authorized(company_id, current_user, db)
-
     logs = (
         db.query(AuditLog)
         .filter(AuditLog.company_id == company_id)
@@ -152,7 +168,6 @@ async def get_audit_log(
         .offset(offset)
         .all()
     )
-
     return [
         {
             "id": str(log.id),
@@ -166,7 +181,9 @@ async def get_audit_log(
     ]
 
 
-# --- Document Routes ---
+# ============================================================
+# Document Routes
+# ============================================================
 
 @router.post("/documents", response_model=DocumentResponse)
 async def create_document(
@@ -201,11 +218,98 @@ async def get_document(
     current_user=Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+    return _get_document_authorized(document_id, current_user, db)
 
-    company = db.query(Company).filter(Company.id == doc.company_id).first()
-    if company.partner_id != _partner_uuid(current_user):
-        raise HTTPException(status_code=403, detail="Access denied")
-    return doc
+
+# ============================================================
+# Manual Override (Phase 2)
+# ============================================================
+
+@router.post("/documents/{document_id}/override")
+async def override_classification(
+    document_id: PyUUID,
+    req: ManualOverrideRequest,
+    current_user=Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    doc = _get_document_authorized(document_id, current_user, db)
+
+    # Create new classification record with override
+    classification = Classification(
+        document_id=document_id,
+        scraper_version="manual_override",
+        model_version="manual_override",
+        classification={
+            "status": req.new_status,
+            "confidence": 1.0,
+            "flags": [],
+            "method": "manual_override",
+            "reason": req.reason,
+            "overridden_by": current_user["user_id"],
+        },
+    )
+    db.add(classification)
+
+    # Update document status
+    doc.extraction_status = "classified"
+    db.commit()
+
+    # Audit log
+    from app.services.audit import log_event
+    log_event(
+        db=db,
+        company_id=str(doc.company_id),
+        event_type="manual_override",
+        document_id=str(document_id),
+        details={
+            "new_status": req.new_status,
+            "reason": req.reason,
+            "overridden_by": current_user["user_id"],
+        },
+        user_id=current_user["user_id"],
+    )
+
+    # Publish Kafka event
+    from app.kafka_producer import publish_event, TOPIC_COMPLIANCE_UPDATES
+    publish_event(TOPIC_COMPLIANCE_UPDATES, {
+        "event_type": "manual_override",
+        "company_id": str(doc.company_id),
+        "document_id": str(document_id),
+        "new_status": req.new_status,
+    })
+
+    return {"ok": True, "message": f"Classification overridden to {req.new_status}"}
+
+
+# ============================================================
+# Retry Document (Phase 2)
+# ============================================================
+
+@router.post("/documents/{document_id}/retry")
+async def retry_document(
+    document_id: PyUUID,
+    current_user=Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    doc = _get_document_authorized(document_id, current_user, db)
+
+    # Reset status and re-queue
+    doc.extraction_status = "pending"
+    doc.error_details = None
+    db.commit()
+
+    from app.tasks.workers import extract_and_classify
+    job = extract_and_classify.apply_async(args=[str(document_id)])
+
+    # Audit log
+    from app.services.audit import log_event
+    log_event(
+        db=db,
+        company_id=str(doc.company_id),
+        event_type="manual_retry",
+        document_id=str(document_id),
+        details={"triggered_by": current_user["user_id"]},
+        user_id=current_user["user_id"],
+    )
+
+    return {"ok": True, "job_id": job.id, "message": "Retry queued"}
