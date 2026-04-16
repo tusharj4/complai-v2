@@ -191,17 +191,6 @@ LAUNCH_CHECKLIST.md    # Go/no-go launch checklist
 
 ---
 
-## Team
-
-| Person | Role | Responsibilities |
-|--------|------|-----------------|
-| **Tushar** | CTO / Product Lead | API design, auth, classification, webhooks, docs |
-| **Rohit** | CS Expert / Domain Lead | Compliance requirements, beta partner feedback |
-| **Priya** | Senior Backend Engineer | Scrapers, OCR, ML pipeline, orchestration, load testing |
-| **Arjun** | Full-Stack Engineer | DB, Kafka, portal, monitoring, DevOps |
-
----
-
 ## Contributing
 
 1. Branch from `main`: `git checkout -b feat/your-feature`
