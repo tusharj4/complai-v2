@@ -31,7 +31,7 @@ def scrape_and_classify_company(self, company_id: str):
 
         logger.info(f"Starting scrape_and_classify for company {company_id}")
 
-        # Step 1: Scrape GST portal
+        # Step 1a: Scrape GST portal
         scraper = GSTScraper(company)
         try:
             scrape_result = scraper.run()
@@ -39,9 +39,33 @@ def scrape_and_classify_company(self, company_id: str):
             scraper.cleanup()
 
         if scrape_result["status"] == "failed":
-            raise Exception(f"Scraper failed: {scrape_result.get('error')}")
+            raise Exception(f"GST Scraper failed: {scrape_result.get('error')}")
 
-        # Log scraper success
+        # Step 1b: Scrape ROC/MCA portal (non-blocking — failure doesn't abort pipeline)
+        roc_result = None
+        try:
+            from app.services.roc_scraper import ROCScraper
+            roc_scraper = ROCScraper(company)
+            try:
+                roc_result = roc_scraper.run()
+            finally:
+                roc_scraper.cleanup()
+
+            if roc_result["status"] == "success":
+                log_event(
+                    db=db,
+                    company_id=company_id,
+                    event_type="roc_scrape_success",
+                    details={
+                        "filings": len(roc_result["data"].get("filings", [])),
+                        "directors": len(roc_result["data"].get("directors", [])),
+                        "compliance_status": roc_result["data"].get("compliance_status"),
+                    },
+                )
+        except Exception as roc_err:
+            logger.warning(f"ROC scraper failed (non-fatal): {roc_err}")
+
+        # Log GST scraper success
         log_event(
             db=db,
             company_id=company_id,
@@ -53,7 +77,7 @@ def scrape_and_classify_company(self, company_id: str):
             },
         )
 
-        # Step 2: Create Document records for each return
+        # Step 2: Create Document records for each GST return
         for return_data in scrape_result["data"].get("returns", []):
             content_hash = hashlib.sha256(str(return_data).encode()).hexdigest()
 

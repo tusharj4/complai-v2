@@ -1,14 +1,14 @@
 import hashlib
 from uuid import UUID as PyUUID
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from app.auth import verify_token
 from app.database import get_db
-from app.models import Company, Document, Classification, AuditLog
+from app.models import Company, Document, Classification, AuditLog, WebhookEndpoint
 from app.api.schemas import (
     CompanyCreate, CompanyResponse, DocumentCreate, DocumentResponse,
-    ManualOverrideRequest,
+    ManualOverrideRequest, WebhookCreate, WebhookResponse,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -110,10 +110,22 @@ async def trigger_scrape(
 @router.get("/companies/{company_id}/compliance-status")
 async def get_compliance_status(
     company_id: PyUUID,
+    request: Request,
     current_user=Depends(verify_token),
     db: Session = Depends(get_db),
 ):
     _get_company_authorized(company_id, current_user, db)
+
+    # Redis cache check — 30 second TTL (matches portal auto-refresh interval)
+    cache_key = f"compliance:{company_id}"
+    cache_get = getattr(request.app.state, "cache_get", lambda k: None)
+    cache_set = getattr(request.app.state, "cache_set", lambda k, v, ttl=30: None)
+
+    cached = cache_get(cache_key)
+    if cached:
+        cached["_cached"] = True
+        return cached
+
     documents = db.query(Document).filter(Document.company_id == company_id).all()
 
     docs_status = []
@@ -138,13 +150,19 @@ async def get_compliance_status(
         d["status"] == "compliant" for d in docs_status
     ) else "at_risk" if docs_status else "no_data"
 
-    return {
+    result = {
         "company_id": str(company_id),
         "overall_status": overall_status,
         "documents": docs_status,
         "total_documents": len(docs_status),
         "last_updated": datetime.now(timezone.utc).isoformat(),
+        "_cached": False,
     }
+
+    # Store in cache (30s TTL)
+    cache_set(cache_key, result, ttl=30)
+
+    return result
 
 
 # ============================================================
@@ -229,6 +247,7 @@ async def get_document(
 async def override_classification(
     document_id: PyUUID,
     req: ManualOverrideRequest,
+    request: Request,
     current_user=Depends(verify_token),
     db: Session = Depends(get_db),
 ):
@@ -268,6 +287,10 @@ async def override_classification(
         },
         user_id=current_user["user_id"],
     )
+
+    # Invalidate compliance-status cache for this company
+    cache_delete = getattr(request.app.state, "cache_delete", lambda k: None)
+    cache_delete(f"compliance:{doc.company_id}")
 
     # Publish Kafka event
     from app.kafka_producer import publish_event, TOPIC_COMPLIANCE_UPDATES
@@ -313,3 +336,79 @@ async def retry_document(
     )
 
     return {"ok": True, "job_id": job.id, "message": "Retry queued"}
+
+
+# ============================================================
+# Webhook Endpoints (Task 4.1.3)
+# ============================================================
+
+@router.post("/webhooks", response_model=WebhookResponse)
+async def create_webhook(
+    req: WebhookCreate,
+    current_user=Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    """Register a webhook endpoint to receive compliance events."""
+    # If company_id provided, verify ownership
+    if req.company_id:
+        _get_company_authorized(req.company_id, current_user, db)
+
+    webhook = WebhookEndpoint(
+        partner_id=_partner_uuid(current_user),
+        company_id=req.company_id,
+        url=req.url,
+        event_types=req.event_types,
+        headers=req.headers or {},
+        secret=req.secret,
+        is_active=True,
+    )
+    db.add(webhook)
+    db.commit()
+    db.refresh(webhook)
+    return webhook
+
+
+@router.get("/webhooks", response_model=list[WebhookResponse])
+async def list_webhooks(
+    current_user=Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    """List all webhook registrations for this partner."""
+    return (
+        db.query(WebhookEndpoint)
+        .filter(WebhookEndpoint.partner_id == _partner_uuid(current_user))
+        .order_by(WebhookEndpoint.created_at.desc())
+        .all()
+    )
+
+
+@router.get("/webhooks/{webhook_id}", response_model=WebhookResponse)
+async def get_webhook(
+    webhook_id: PyUUID,
+    current_user=Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    wh = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id).first()
+    if not wh:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    if wh.partner_id != _partner_uuid(current_user):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return wh
+
+
+@router.delete("/webhooks/{webhook_id}")
+async def delete_webhook(
+    webhook_id: PyUUID,
+    current_user=Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    """Deactivate a webhook (soft delete)."""
+    wh = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id).first()
+    if not wh:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    if wh.partner_id != _partner_uuid(current_user):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    wh.is_active = False
+    db.commit()
+    return {"ok": True, "message": "Webhook deactivated"}

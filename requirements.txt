@@ -13,3 +13,4 @@ PyJWT==2.8.0
 python-multipart==0.0.6
 kafka-python==2.0.2
 alembic==1.13.0
+slowapi==0.1.9

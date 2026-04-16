@@ -73,10 +73,39 @@ class ManualOverrideRequest(BaseModel):
 
 # --- Webhook Schemas ---
 
+VALID_EVENT_TYPES = {
+    "compliance_check_complete",
+    "manual_override",
+    "scrape_complete",
+    "scrape_failed",
+    "extraction_complete",
+    "extraction_failed",
+    "classification_complete",
+    "*",  # wildcard — receive all events
+}
+
+
 class WebhookCreate(BaseModel):
-    url: str = Field(..., min_length=10)
+    url: str = Field(..., min_length=10, max_length=2048)
     event_types: List[str] = Field(..., min_length=1)
     company_id: Optional[UUID] = None
+    secret: Optional[str] = Field(None, max_length=255)
+    headers: Optional[Dict[str, str]] = None
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v):
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return v
+
+    @field_validator("event_types")
+    @classmethod
+    def validate_event_types(cls, v):
+        invalid = [e for e in v if e not in VALID_EVENT_TYPES]
+        if invalid:
+            raise ValueError(f"Invalid event types: {invalid}. Valid: {sorted(VALID_EVENT_TYPES)}")
+        return v
 
 
 class WebhookResponse(BaseModel):
@@ -84,4 +113,10 @@ class WebhookResponse(BaseModel):
     url: str
     event_types: List[str]
     company_id: Optional[UUID] = None
-    is_active: bool = True
+    is_active: bool
+    last_delivery_status: Optional[str] = None
+    last_delivery_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
